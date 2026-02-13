@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Token Dynamic — Minter Network</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        html,
+        body {
+            width: 100%;
+            height: 100%;
+            background: #000;
+            overflow: hidden;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        canvas {
+            display: block;
+            image-rendering: auto;
+        }
+    </style>
+</head>
+
+<body>
+    <canvas id="c"></canvas>
+    <script>
+        (() => {
+            /* ── Config ─────────────────────────────────────────── */
+            const CANVAS_SIZE = 1080;          // square canvas
+            const NODE_COUNT = 24;
+            const IMG_DRAW_SIZE = 96;            // rendered size of each ART icon
+            const CONNECT_DIST = 450;           // max distance to draw a line
+            const FONT = '600 22px "Inter", "Segoe UI", system-ui, sans-serif';
+            const LABEL_GAP = 6;             // gap between icon and label
+            const LINE_ALPHA = 0.7;
+            const LINE_COLOR = 'rgba(255,255,255,';
+
+            /* ── Canvas setup ───────────────────────────────────── */
+            const cvs = document.getElementById('c');
+            const ctx = cvs.getContext('2d');
+            const dpr = window.devicePixelRatio || 1;
+
+            function resize() {
+                const edge = Math.min(window.innerWidth, window.innerHeight);
+                cvs.style.width = edge + 'px';
+                cvs.style.height = edge + 'px';
+                cvs.width = edge * dpr;
+                cvs.height = edge * dpr;
+            }
+            resize();
+            window.addEventListener('resize', resize);
+
+            /* ── Load ART image ─────────────────────────────────── */
+            const artImg = new Image();
+            artImg.src = 'ART256.png';
+
+            /* ── Nodes ──────────────────────────────────────────── */
+            const PAD = 80; // keep nodes away from edges
+            const nodes = [];
+
+            function rand(lo, hi) { return lo + Math.random() * (hi - lo); }
+
+            for (let i = 0; i < NODE_COUNT; i++) {
+                nodes.push({
+                    label: `minter ${i + 1}`,
+                    // home position (normalized 0-1, mapped to canvas later)
+                    hx: rand(PAD / CANVAS_SIZE, 1 - PAD / CANVAS_SIZE),
+                    hy: rand(PAD / CANVAS_SIZE, 1 - PAD / CANVAS_SIZE),
+                    // floating parameters — 1-3x variance in speed/intensity
+                    ampX: rand(9, 99),
+                    ampY: rand(9, 99),
+                    freqX: rand(0.15, 1.35),
+                    freqY: rand(0.15, 1.35),
+                    phaseX: rand(0, Math.PI * 2),
+                    phaseY: rand(0, Math.PI * 2),
+                    // current position (set each frame)
+                    x: 0, y: 0
+                });
+            }
+
+            /* ── Draw helpers ───────────────────────────────────── */
+            function drawLine(ax, ay, bx, by, alpha) {
+                ctx.strokeStyle = LINE_COLOR + alpha.toFixed(3) + ')';
+                ctx.lineWidth = 2.5 * dpr;
+                ctx.beginPath();
+                ctx.moveTo(ax, ay);
+                ctx.lineTo(bx, by);
+                ctx.stroke();
+            }
+
+            /* ── Main loop ──────────────────────────────────────── */
+            let t0 = null;
+
+            function frame(ts) {
+                if (!t0) t0 = ts;
+                const t = (ts - t0) / 1000; // seconds
+
+                const w = cvs.width;
+                const h = cvs.height;
+                const s = w / CANVAS_SIZE; // scale factor
+
+                ctx.clearRect(0, 0, w, h);
+
+                /* Update positions */
+                for (const n of nodes) {
+                    n.x = n.hx * w + Math.sin(t * n.freqX + n.phaseX) * n.ampX * s;
+                    n.y = n.hy * h + Math.sin(t * n.freqY + n.phaseY) * n.ampY * s;
+                }
+
+                /* Draw connections (proximity-based) */
+                const maxDist = CONNECT_DIST * s;
+                for (let i = 0; i < NODE_COUNT; i++) {
+                    for (let j = i + 1; j < NODE_COUNT; j++) {
+                        const dx = nodes[j].x - nodes[i].x;
+                        const dy = nodes[j].y - nodes[i].y;
+                        const dist = Math.sqrt(dx * dx + dy * dy);
+                        if (dist < maxDist) {
+                            const alpha = LINE_ALPHA * (1 - dist / maxDist);
+                            drawLine(nodes[i].x, nodes[i].y, nodes[j].x, nodes[j].y, alpha);
+                        }
+                    }
+                }
+
+                /* Draw nodes */
+                const iw = IMG_DRAW_SIZE * s;
+                ctx.font = `600 ${Math.round(22 * s)}px "Inter", "Segoe UI", system-ui, sans-serif`;
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'top';
+
+                for (const n of nodes) {
+                    // ART icon
+                    if (artImg.complete && artImg.naturalWidth > 0) {
+                        ctx.drawImage(artImg, n.x - iw / 2, n.y - iw / 2, iw, iw);
+                    }
+                    // Label
+                    ctx.fillStyle = 'rgba(255,255,255,0.72)';
+                    ctx.fillText(n.label, n.x, n.y + iw / 2 + LABEL_GAP * s);
+                }
+
+                requestAnimationFrame(frame);
+            }
+
+            artImg.onload = () => requestAnimationFrame(frame);
+            // fallback in case image is cached
+            if (artImg.complete) requestAnimationFrame(frame);
+        })();
+    </script>
+</body>
+
+</html>
