@@ -35,14 +35,27 @@
     <script>
         (() => {
             /* ── Config ─────────────────────────────────────────── */
-            const NODE_COUNT = 24;
+            const DEFAULT_NODE_COUNT = 24;
             const IMG_DRAW_SIZE = 96;            // rendered size of each ART icon (at 1080-scale)
+            const MIN_IMG_HEIGHT_PCT = 0.01;     // 1% of rendered canvas height
+            const MAX_IMG_HEIGHT_PCT = 0.10;     // 10% of rendered canvas height
+            const DEFAULT_IMG_HEIGHT_PCT = IMG_DRAW_SIZE / 1080;
             const CONNECT_DIST = 450;           // max distance to draw a line (at 1080-scale)
             const LABEL_GAP = 6;
-            const LINE_ALPHA = 0.7;
+            const LABEL_GAP_ICON_FACTOR = 0.04;  // extra gap scales with icon size
+            const QTY_GAP = 4;
+            const QTY_FONT_SCALE = 0.82;
+            const LINE_ALPHA = 0.5;
             const LINE_COLOR = 'rgba(255,255,255,';
             const DYNAMIC_OPACITY = 0.9;        // 90% opacity for the dynamic layer
             const BLEND_MODE = 'screen';
+            const LINKS_PER_NODE = 20;
+            const IDLE_BASE_ALPHA = 0.75;
+            const HOVER_BASE_ALPHA = 0.2;
+            const ALCHEMY_API_KEY = '98SpYkG31YnJkLbr5dSGMG2rI924IhBl';
+            const CONTRACT_ADDRESS = '0xe6e16846299994c1cfa855490c6339fbcae7514c';
+            const ALCHEMY_NFT_BASE = `https://eth-mainnet.g.alchemy.com/nft/v3/${ALCHEMY_API_KEY}`;
+            const ENS_LOOKUP_BASE = 'https://api.ensideas.com/ens/resolve';
 
             /* ── Canvas + contexts ─────────────────────────────── */
             const cvs = document.getElementById('c');
@@ -52,6 +65,14 @@
             // Offscreen canvas for dynamic layer (nodes/lines)
             const offCvs = document.createElement('canvas');
             const offCtx = offCvs.getContext('2d');
+            const pointer = {
+                x: 0,
+                y: 0,
+                active: false,
+                lockedNodeIndex: -1,
+                hoverNodeIndex: -1,
+                needsHoverPick: false
+            };
 
             /* ── Load images ───────────────────────────────────── */
             const canvasImg = new Image();    // background photo
@@ -68,8 +89,8 @@
 
             Promise.all([
                 loadImg(canvasImg, 'Canvas.jpg'),
-                loadImg(maskImg, 'Canvas_mask.jpg'),
-                loadImg(artImg, 'ART256.png')
+                loadImg(maskImg, 'Canvas_mask_new.jpg'),
+                loadImg(artImg, 'ART256_new.png')
             ]).then(init).catch(err => {
                 // Show error visibly on the canvas
                 cvs.width = 800; cvs.height = 200;
@@ -118,6 +139,192 @@
             /* ── Nodes ──────────────────────────────────────────── */
             const nodes = [];
             function rand(lo, hi) { return lo + Math.random() * (hi - lo); }
+            function randInt(lo, hi) {
+                return Math.floor(rand(lo, hi + 1));
+            }
+            function clamp(value, min, max) {
+                return Math.max(min, Math.min(max, value));
+            }
+            function abbreviateAddress(address) {
+                if (!address || address.length < 10) return address || 'unknown';
+                return `${address.slice(0, 6)}...${address.slice(-4)}`;
+            }
+
+            function sanitizeAddress(value) {
+                if (typeof value !== 'string') return '';
+                const trimmed = value.trim();
+                if (!/^0x[a-fA-F0-9]{40}$/.test(trimmed)) return '';
+                return trimmed.toLowerCase();
+            }
+
+            function toBigIntBalance(value) {
+                if (typeof value === 'bigint') return value >= 0n ? value : 0n;
+                if (typeof value === 'number') {
+                    if (!Number.isFinite(value) || value <= 0) return 0n;
+                    return BigInt(Math.floor(value));
+                }
+                if (typeof value === 'string') {
+                    const trimmed = value.trim();
+                    if (!trimmed) return 0n;
+                    try {
+                        const parsed = BigInt(trimmed);
+                        return parsed >= 0n ? parsed : 0n;
+                    } catch {
+                        return 0n;
+                    }
+                }
+                return 0n;
+            }
+
+            function extractOwnerBalance(owner) {
+                if (!owner || typeof owner !== 'object') return 0n;
+                if (Array.isArray(owner.tokenBalances) && owner.tokenBalances.length) {
+                    return owner.tokenBalances.reduce((sum, item) => {
+                        return sum + toBigIntBalance(item?.balance);
+                    }, 0n);
+                }
+                return toBigIntBalance(owner.balance);
+            }
+
+            function mapBalanceToSizePct(balance, minBalance, maxBalance) {
+                if (maxBalance <= minBalance) {
+                    return (MIN_IMG_HEIGHT_PCT + MAX_IMG_HEIGHT_PCT) / 2;
+                }
+                const b = Number(balance);
+                const min = Number(minBalance);
+                const max = Number(maxBalance);
+                if (!Number.isFinite(b) || !Number.isFinite(min) || !Number.isFinite(max) || max <= min) {
+                    return DEFAULT_IMG_HEIGHT_PCT;
+                }
+                const t = clamp((b - min) / (max - min), 0, 1);
+                return MIN_IMG_HEIGHT_PCT + t * (MAX_IMG_HEIGHT_PCT - MIN_IMG_HEIGHT_PCT);
+            }
+
+            async function fetchOwnersForContractWithBalances(contractAddress) {
+                let pageKey = null;
+                const ownersByAddress = new Map();
+
+                do {
+                    const params = new URLSearchParams({ contractAddress, withTokenBalances: 'true' });
+                    if (pageKey) params.set('pageKey', pageKey);
+                    const url = `${ALCHEMY_NFT_BASE}/getOwnersForContract?${params.toString()}`;
+                    const response = await fetch(url, { method: 'GET' });
+                    if (!response.ok) {
+                        throw new Error(`Alchemy getOwnersForContract failed (${response.status})`);
+                    }
+
+                    const data = await response.json();
+                    const rawOwners = Array.isArray(data.owners)
+                        ? data.owners
+                        : Array.isArray(data.ownerAddresses)
+                            ? data.ownerAddresses
+                            : [];
+
+                    for (const owner of rawOwners) {
+                        const address = sanitizeAddress(
+                            typeof owner === 'string' ? owner : owner?.ownerAddress
+                        );
+                        if (!address) continue;
+                        const ownerBalance = typeof owner === 'string' ? 1n : extractOwnerBalance(owner);
+                        const prev = ownersByAddress.get(address) || 0n;
+                        ownersByAddress.set(address, prev + ownerBalance);
+                    }
+
+                    pageKey = data.pageKey || null;
+                } while (pageKey);
+
+                return [...ownersByAddress.entries()].map(([address, balance]) => ({ address, balance }));
+            }
+
+            async function resolveEnsName(address) {
+                try {
+                    const response = await fetch(`${ENS_LOOKUP_BASE}/${address}`, { method: 'GET' });
+                    if (!response.ok) return null;
+                    const data = await response.json();
+                    if (data && typeof data.name === 'string' && data.name.trim()) {
+                        return data.name.trim();
+                    }
+                } catch {
+                    // ENS lookups are best-effort only.
+                }
+                return null;
+            }
+
+            async function getHoldersWithLabelsAndSizes() {
+                const owners = await fetchOwnersForContractWithBalances(CONTRACT_ADDRESS);
+                if (!owners.length) return [];
+
+                let minBalance = owners[0].balance;
+                let maxBalance = owners[0].balance;
+                for (const owner of owners) {
+                    if (owner.balance < minBalance) minBalance = owner.balance;
+                    if (owner.balance > maxBalance) maxBalance = owner.balance;
+                }
+
+                return Promise.all(
+                    owners.map(async owner => {
+                        const ens = await resolveEnsName(owner.address);
+                        return {
+                            address: owner.address,
+                            label: ens || abbreviateAddress(owner.address),
+                            balance: owner.balance,
+                            quantityLabel: owner.balance.toString(),
+                            imgHeightPct: mapBalanceToSizePct(owner.balance, minBalance, maxBalance)
+                        };
+                    })
+                );
+            }
+
+            function buildNodes(holderData) {
+                const nodeData = holderData.length
+                    ? holderData
+                    : Array.from({ length: DEFAULT_NODE_COUNT }, (_, i) => ({
+                        label: `holder ${i + 1}`,
+                        quantityLabel: '',
+                        imgHeightPct: DEFAULT_IMG_HEIGHT_PCT
+                    }));
+                const count = nodeData.length;
+                const SPAWN_PAD_X_NORM = 0.05;
+                const SPAWN_PAD_TOP_NORM = 0;
+                const SPAWN_PAD_BOTTOM_NORM = 0.05;
+
+                nodes.length = 0;
+                for (let i = 0; i < count; i++) {
+                    nodes.push({
+                        label: nodeData[i].label,
+                        quantityLabel: nodeData[i].quantityLabel || '',
+                        imgHeightPct: clamp(nodeData[i].imgHeightPct ?? DEFAULT_IMG_HEIGHT_PCT, MIN_IMG_HEIGHT_PCT, MAX_IMG_HEIGHT_PCT),
+                        // home position normalized within mask bounds
+                        hx: maskBounds.x + maskBounds.w * rand(SPAWN_PAD_X_NORM, 1 - SPAWN_PAD_X_NORM),
+                        hy: maskBounds.y + maskBounds.h * rand(SPAWN_PAD_TOP_NORM, 1 - SPAWN_PAD_BOTTOM_NORM),
+                        // floating parameters
+                        ampX: rand(6, 40),
+                        ampY: rand(6, 40),
+                        freqX: rand(0.15, 1.35),
+                        freqY: rand(0.15, 1.35),
+                        phaseX: rand(0, Math.PI * 2),
+                        phaseY: rand(0, Math.PI * 2),
+                        links: [],
+                        drawH: 0,
+                        drawW: 0,
+                        x: 0, y: 0
+                    });
+                }
+                assignRandomLinks();
+            }
+
+            function assignRandomLinks() {
+                const n = nodes.length;
+                const picksPerNode = Math.min(LINKS_PER_NODE, Math.max(0, n - 1));
+                for (let i = 0; i < n; i++) {
+                    const picks = new Set();
+                    while (picks.size < picksPerNode) {
+                        const j = randInt(0, n - 1);
+                        if (j !== i) picks.add(j);
+                    }
+                    nodes[i].links = [...picks];
+                }
+            }
 
             /* ── Sizing ────────────────────────────────────────── */
             let aspectRatio = 1;     // width / height of Canvas.jpg
@@ -149,35 +356,101 @@
                 offCvs.height = cvs.height;
             }
 
+            function updatePointerFromClient(clientX, clientY) {
+                const rect = cvs.getBoundingClientRect();
+                const inBounds =
+                    clientX >= rect.left &&
+                    clientX <= rect.right &&
+                    clientY >= rect.top &&
+                    clientY <= rect.bottom;
+                pointer.x = (clientX - rect.left) * dpr;
+                pointer.y = (clientY - rect.top) * dpr;
+                pointer.active = inBounds;
+            }
+
+            function pickNodeAtPoint(px, py, s) {
+                let bestIndex = -1;
+                let bestDist = Infinity;
+                for (let i = 0; i < nodes.length; i++) {
+                    const n = nodes[i];
+                    const dx = px - n.x;
+                    const dy = py - n.y;
+                    const dist = Math.sqrt(dx * dx + dy * dy);
+                    const hitR = Math.max(24 * s, n.drawW * 0.6);
+                    if (dist <= hitR && dist < bestDist) {
+                        bestDist = dist;
+                        bestIndex = i;
+                    }
+                }
+                return bestIndex;
+            }
+
+            function attachPointerEvents() {
+                window.addEventListener('mousemove', (event) => {
+                    updatePointerFromClient(event.clientX, event.clientY);
+                    pointer.needsHoverPick = true;
+                });
+                cvs.addEventListener('mouseleave', () => {
+                    if (pointer.lockedNodeIndex < 0) pointer.active = false;
+                    pointer.hoverNodeIndex = -1;
+                    pointer.needsHoverPick = false;
+                });
+                window.addEventListener('touchstart', (event) => {
+                    if (!event.touches.length) return;
+                    const t = event.touches[0];
+                    updatePointerFromClient(t.clientX, t.clientY);
+                    const s = cvs.width / REF_W;
+                    const hitIndex = pickNodeAtPoint(pointer.x, pointer.y, s);
+                    if (hitIndex >= 0) {
+                        pointer.lockedNodeIndex = hitIndex;
+                        pointer.active = true;
+                    }
+                }, { passive: true });
+                window.addEventListener('touchmove', (event) => {
+                    if (!event.touches.length) return;
+                    const t = event.touches[0];
+                    updatePointerFromClient(t.clientX, t.clientY);
+                }, { passive: true });
+                window.addEventListener('touchend', () => {
+                    pointer.active = pointer.lockedNodeIndex >= 0;
+                }, { passive: true });
+                window.addEventListener('touchcancel', () => {
+                    pointer.active = pointer.lockedNodeIndex >= 0;
+                }, { passive: true });
+                window.addEventListener('blur', () => {
+                    pointer.active = false;
+                    pointer.lockedNodeIndex = -1;
+                    pointer.hoverNodeIndex = -1;
+                    pointer.needsHoverPick = false;
+                });
+                document.addEventListener('visibilitychange', () => {
+                    if (!document.hidden) return;
+                    pointer.active = false;
+                    pointer.lockedNodeIndex = -1;
+                    pointer.hoverNodeIndex = -1;
+                    pointer.needsHoverPick = false;
+                });
+            }
+
             /* ── Init (called once all images are loaded) ──────── */
             function init() {
                 aspectRatio = canvasImg.naturalWidth / canvasImg.naturalHeight;
                 maskBounds = detectMaskBounds(maskImg);
                 REF_W = canvasImg.naturalWidth;
-
-                // Padding inside mask bounds (normalized, relative to mask region)
-                const PAD_NORM = 0.06;
-
-                for (let i = 0; i < NODE_COUNT; i++) {
-                    nodes.push({
-                        label: `minter ${i + 1}`,
-                        // home position normalized within mask bounds
-                        hx: maskBounds.x + maskBounds.w * rand(PAD_NORM, 1 - PAD_NORM),
-                        hy: maskBounds.y + maskBounds.h * rand(PAD_NORM, 1 - PAD_NORM),
-                        // floating parameters
-                        ampX: rand(6, 40),
-                        ampY: rand(6, 40),
-                        freqX: rand(0.15, 1.35),
-                        freqY: rand(0.15, 1.35),
-                        phaseX: rand(0, Math.PI * 2),
-                        phaseY: rand(0, Math.PI * 2),
-                        x: 0, y: 0
-                    });
-                }
+                buildNodes([]);
 
                 resize();
                 window.addEventListener('resize', resize);
+                attachPointerEvents();
                 requestAnimationFrame(frame);
+
+                getHoldersWithLabelsAndSizes()
+                    .then(holders => {
+                        if (holders.length) buildNodes(holders);
+                    })
+                    .catch(error => {
+                        console.error('Failed to load holders:', error);
+                    });
             }
 
             /* ── Draw helpers ───────────────────────────────────── */
@@ -212,37 +485,111 @@
                 offCtx.globalAlpha = 1;
 
                 // Update node positions
+                const fontSize = Math.round(22 * s);
+                const qtyFontSize = Math.max(12, Math.round(fontSize * QTY_FONT_SCALE));
+                offCtx.font = `600 ${fontSize}px "Inter", "Segoe UI", system-ui, sans-serif`;
+                const maskLeft = maskBounds.x * w;
+                const maskRight = (maskBounds.x + maskBounds.w) * w;
+                const maskTop = maskBounds.y * h;
+                const maskBottom = (maskBounds.y + maskBounds.h) * h;
+
                 for (const n of nodes) {
-                    n.x = n.hx * w + Math.sin(t * n.freqX + n.phaseX) * n.ampX * s;
-                    n.y = n.hy * h + Math.sin(t * n.freqY + n.phaseY) * n.ampY * s;
+                    const baseX = n.hx * w + Math.sin(t * n.freqX + n.phaseX) * n.ampX * s;
+                    const baseY = n.hy * h + Math.sin(t * n.freqY + n.phaseY) * n.ampY * s;
+                    const nodeH = clamp((n.imgHeightPct ?? DEFAULT_IMG_HEIGHT_PCT) * h, 2, h);
+                    const artAspect = (artImg.naturalWidth > 0 && artImg.naturalHeight > 0)
+                        ? artImg.naturalWidth / artImg.naturalHeight
+                        : 1;
+                    const nodeW = nodeH * artAspect;
+                    n.drawH = nodeH;
+                    n.drawW = nodeW;
+
+                    const textWidth = offCtx.measureText(n.label).width;
+                    const halfNodeW = Math.max(nodeW / 2, textWidth / 2);
+                    const topExtent = nodeH / 2;
+                    const labelGap = LABEL_GAP * s + nodeH * LABEL_GAP_ICON_FACTOR;
+                    const qtyGap = QTY_GAP * s;
+                    const bottomExtent = nodeH / 2 + labelGap + fontSize + qtyGap + qtyFontSize;
+
+                    const minX = maskLeft + halfNodeW;
+                    const maxX = maskRight - halfNodeW;
+                    const minY = maskTop + topExtent;
+                    const maxY = maskBottom - bottomExtent;
+
+                    n.x = minX <= maxX ? clamp(baseX, minX, maxX) : (maskLeft + maskRight) / 2;
+                    n.y = minY <= maxY ? clamp(baseY, minY, maxY) : (maskTop + maskBottom) / 2;
                 }
+
+                let activeNodeIndex = -1;
+                if (pointer.lockedNodeIndex >= 0 && pointer.lockedNodeIndex < nodes.length) {
+                    activeNodeIndex = pointer.lockedNodeIndex;
+                } else if (pointer.active) {
+                    if (pointer.needsHoverPick) {
+                        pointer.hoverNodeIndex = pickNodeAtPoint(pointer.x, pointer.y, s);
+                        pointer.needsHoverPick = false;
+                    }
+                    activeNodeIndex = pointer.hoverNodeIndex;
+                }
+
+                const isHoveringCanvas = pointer.active || pointer.lockedNodeIndex >= 0;
+                const hasFocus = activeNodeIndex >= 0;
 
                 // Draw connections
                 const maxDist = CONNECT_DIST * s;
-                for (let i = 0; i < NODE_COUNT; i++) {
-                    for (let j = i + 1; j < NODE_COUNT; j++) {
-                        const dx = nodes[j].x - nodes[i].x;
-                        const dy = nodes[j].y - nodes[i].y;
-                        const dist = Math.sqrt(dx * dx + dy * dy);
-                        if (dist < maxDist) {
-                            const alpha = LINE_ALPHA * (1 - dist / maxDist);
-                            drawLine(offCtx, nodes[i].x, nodes[i].y, nodes[j].x, nodes[j].y, alpha, 2.5 * dpr);
-                        }
+                const edgeMap = new Map();
+                for (let i = 0; i < nodes.length; i++) {
+                    for (const j of nodes[i].links) {
+                        const a = Math.min(i, j);
+                        const b = Math.max(i, j);
+                        const key = `${a}-${b}`;
+                        if (edgeMap.has(key)) continue;
+                        edgeMap.set(key, { a, b });
+                    }
+                }
+                for (const edge of edgeMap.values()) {
+                    const dx = nodes[edge.b].x - nodes[edge.a].x;
+                    const dy = nodes[edge.b].y - nodes[edge.a].y;
+                    const dist = Math.sqrt(dx * dx + dy * dy);
+                    if (dist < maxDist) {
+                        const alpha = LINE_ALPHA * (1 - dist / maxDist);
+                        drawLine(
+                            offCtx,
+                            nodes[edge.a].x,
+                            nodes[edge.a].y,
+                            nodes[edge.b].x,
+                            nodes[edge.b].y,
+                            alpha,
+                            1 * dpr
+                        );
                     }
                 }
 
                 // Draw nodes
-                const iw = IMG_DRAW_SIZE * s;
-                offCtx.font = `600 ${Math.round(22 * s)}px "Inter", "Segoe UI", system-ui, sans-serif`;
                 offCtx.textAlign = 'center';
                 offCtx.textBaseline = 'top';
 
                 for (const n of nodes) {
+                    const labelGap = LABEL_GAP * s + n.drawH * LABEL_GAP_ICON_FACTOR;
+                    const labelY = n.y + n.drawH / 2 + labelGap;
+                    const nodeFocused = activeNodeIndex >= 0 && nodes[activeNodeIndex] === n;
+                    const baseAlpha = isHoveringCanvas ? HOVER_BASE_ALPHA : IDLE_BASE_ALPHA;
+                    const iconAlpha = nodeFocused ? 1 : baseAlpha;
+                    const labelAlpha = nodeFocused ? 1 : baseAlpha;
+
                     if (artImg.complete && artImg.naturalWidth > 0) {
-                        offCtx.drawImage(artImg, n.x - iw / 2, n.y - iw / 2, iw, iw);
+                        offCtx.globalAlpha = iconAlpha;
+                        offCtx.drawImage(artImg, n.x - n.drawW / 2, n.y - n.drawH / 2, n.drawW, n.drawH);
+                        offCtx.globalAlpha = 1;
                     }
-                    offCtx.fillStyle = 'rgba(255,255,255,0.72)';
-                    offCtx.fillText(n.label, n.x, n.y + iw / 2 + LABEL_GAP * s);
+                    offCtx.fillStyle = nodeFocused ? '#ffffff' : `rgba(255,255,255,${labelAlpha.toFixed(3)})`;
+                    offCtx.fillText(n.label, n.x, labelY);
+                    if (nodeFocused && n.quantityLabel) {
+                        const qtyGap = QTY_GAP * s;
+                        offCtx.font = `600 ${Math.max(12, Math.round(Math.round(22 * s) * QTY_FONT_SCALE))}px "Inter", "Segoe UI", system-ui, sans-serif`;
+                        offCtx.fillStyle = '#ffffff';
+                        offCtx.fillText(`Qty: ${n.quantityLabel}`, n.x, labelY + Math.round(22 * s) + qtyGap);
+                        offCtx.font = `600 ${Math.round(22 * s)}px "Inter", "Segoe UI", system-ui, sans-serif`;
+                    }
                 }
 
                 /* ── Clip dynamic layer with mask ──────────────── */
