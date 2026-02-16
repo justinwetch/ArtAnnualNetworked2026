@@ -43,8 +43,6 @@
             const CONNECT_DIST = 450;           // max distance to draw a line (at 1080-scale)
             const LABEL_GAP = 6;
             const LABEL_GAP_ICON_FACTOR = 0.04;  // extra gap scales with icon size
-            const QTY_GAP = 4;
-            const QTY_FONT_SCALE = 0.82;
             const LINE_ALPHA = 0.5;
             const LINE_COLOR = 'rgba(255,255,255,';
             const DYNAMIC_OPACITY = 0.9;        // 90% opacity for the dynamic layer
@@ -268,7 +266,6 @@
                             address: owner.address,
                             label: ens || abbreviateAddress(owner.address),
                             balance: owner.balance,
-                            quantityLabel: owner.balance.toString(),
                             imgHeightPct: mapBalanceToSizePct(owner.balance, minBalance, maxBalance)
                         };
                     })
@@ -280,7 +277,6 @@
                     ? holderData
                     : Array.from({ length: DEFAULT_NODE_COUNT }, (_, i) => ({
                         label: `holder ${i + 1}`,
-                        quantityLabel: '',
                         imgHeightPct: DEFAULT_IMG_HEIGHT_PCT
                     }));
                 const count = nodeData.length;
@@ -292,7 +288,6 @@
                 for (let i = 0; i < count; i++) {
                     nodes.push({
                         label: nodeData[i].label,
-                        quantityLabel: nodeData[i].quantityLabel || '',
                         imgHeightPct: clamp(nodeData[i].imgHeightPct ?? DEFAULT_IMG_HEIGHT_PCT, MIN_IMG_HEIGHT_PCT, MAX_IMG_HEIGHT_PCT),
                         // home position normalized within mask bounds
                         hx: maskBounds.x + maskBounds.w * rand(SPAWN_PAD_X_NORM, 1 - SPAWN_PAD_X_NORM),
@@ -485,9 +480,8 @@
                 offCtx.globalAlpha = 1;
 
                 // Update node positions
+                offCtx.font = `600 ${Math.round(22 * s)}px "Inter", "Segoe UI", system-ui, sans-serif`;
                 const fontSize = Math.round(22 * s);
-                const qtyFontSize = Math.max(12, Math.round(fontSize * QTY_FONT_SCALE));
-                offCtx.font = `600 ${fontSize}px "Inter", "Segoe UI", system-ui, sans-serif`;
                 const maskLeft = maskBounds.x * w;
                 const maskRight = (maskBounds.x + maskBounds.w) * w;
                 const maskTop = maskBounds.y * h;
@@ -508,8 +502,7 @@
                     const halfNodeW = Math.max(nodeW / 2, textWidth / 2);
                     const topExtent = nodeH / 2;
                     const labelGap = LABEL_GAP * s + nodeH * LABEL_GAP_ICON_FACTOR;
-                    const qtyGap = QTY_GAP * s;
-                    const bottomExtent = nodeH / 2 + labelGap + fontSize + qtyGap + qtyFontSize;
+                    const bottomExtent = nodeH / 2 + labelGap + fontSize;
 
                     const minX = maskLeft + halfNodeW;
                     const maxX = maskRight - halfNodeW;
@@ -583,13 +576,6 @@
                     }
                     offCtx.fillStyle = nodeFocused ? '#ffffff' : `rgba(255,255,255,${labelAlpha.toFixed(3)})`;
                     offCtx.fillText(n.label, n.x, labelY);
-                    if (nodeFocused && n.quantityLabel) {
-                        const qtyGap = QTY_GAP * s;
-                        offCtx.font = `600 ${Math.max(12, Math.round(Math.round(22 * s) * QTY_FONT_SCALE))}px "Inter", "Segoe UI", system-ui, sans-serif`;
-                        offCtx.fillStyle = '#ffffff';
-                        offCtx.fillText(`Qty: ${n.quantityLabel}`, n.x, labelY + Math.round(22 * s) + qtyGap);
-                        offCtx.font = `600 ${Math.round(22 * s)}px "Inter", "Segoe UI", system-ui, sans-serif`;
-                    }
                 }
 
                 /* ── Clip dynamic layer with mask ──────────────── */
