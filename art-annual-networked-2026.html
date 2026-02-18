@@ -39,6 +39,7 @@
             const IMG_DRAW_SIZE = 96;            // rendered size of each ART icon (at 1080-scale)
             const MIN_IMG_HEIGHT_PCT = 0.01;     // 1% of rendered canvas height
             const MAX_IMG_HEIGHT_PCT = 0.10;     // 10% of rendered canvas height
+            const FALLBACK_MAX_IMG_HEIGHT_PCT = 0.05; // 5% max when using fallback network
             const DEFAULT_IMG_HEIGHT_PCT = IMG_DRAW_SIZE / 1080;
             const CONNECT_DIST = 450;           // max distance to draw a line (at 1080-scale)
             const LABEL_GAP = 6;
@@ -50,8 +51,9 @@
             const LINKS_PER_NODE = 20;
             const IDLE_BASE_ALPHA = 0.75;
             const HOVER_BASE_ALPHA = 0.2;
-            const ALCHEMY_API_KEY = '98SpYkG31YnJkLbr5dSGMG2rI924IhBl';
-            const CONTRACT_ADDRESS = '0xe6e16846299994c1cfa855490c6339fbcae7514c';
+            const FALLBACK_NODE_COUNT = 100;
+            const ALCHEMY_API_KEY = 'c0p9shQeG4rR4DYn3yyaVpfkjVFgyN2_';
+            const CONTRACT_ADDRESS = '0x4d2ba0292662e38a9ef82c6a11e671de218edda9';
             const ALCHEMY_NFT_BASE = `https://eth-mainnet.g.alchemy.com/nft/v3/${ALCHEMY_API_KEY}`;
             const ENS_LOOKUP_BASE = 'https://api.ensideas.com/ens/resolve';
 
@@ -76,19 +78,34 @@
             const canvasImg = new Image();    // background photo
             const maskImg = new Image();      // mask (white = show, black = hide)
             const artImg = new Image();       // ART icon
+            const IPFS_PRIMARY_PREFIX = 'https://ipfs.io/ipfs/';
+            const IPFS_BACKUP_PREFIX = 'https://dweb.link/ipfs/';
 
             function loadImg(img, src) {
                 return new Promise((resolve, reject) => {
+                    const isPrimaryIpfs = src.startsWith(IPFS_PRIMARY_PREFIX);
+                    const backupSrc = isPrimaryIpfs
+                        ? IPFS_BACKUP_PREFIX + src.slice(IPFS_PRIMARY_PREFIX.length)
+                        : null;
+                    let triedBackup = false;
                     img.onload = () => resolve(img);
-                    img.onerror = () => reject(new Error('Failed to load: ' + src));
+                    img.onerror = () => {
+                        if (backupSrc && !triedBackup) {
+                            triedBackup = true;
+                            img.src = backupSrc;
+                            return;
+                        }
+                        reject(new Error(`Failed to load: ${src}${backupSrc ? ` (and backup: ${backupSrc})` : ''}`));
+                    };
+                    img.crossOrigin = 'anonymous';
                     img.src = src;
                 });
             }
 
             Promise.all([
-                loadImg(canvasImg, 'Canvas.jpg'),
-                loadImg(maskImg, 'Canvas_mask_new.jpg'),
-                loadImg(artImg, 'ART256_new.png')
+                loadImg(canvasImg, 'https://ipfs.io/ipfs/QmQsNWcbouZT8hyPdfiBmEZVnNdi8Do4ehw5Z4zJX7Mpwo/Canvas.jpg'),
+                loadImg(maskImg, 'https://ipfs.io/ipfs/QmQsNWcbouZT8hyPdfiBmEZVnNdi8Do4ehw5Z4zJX7Mpwo/Canvas_mask_new.jpg'),
+                loadImg(artImg, 'https://ipfs.io/ipfs/QmTotXBdYA5ww3ZJEmXRBzT8TnDWqxpMNAfJhGnGXn8PYg')
             ]).then(init).catch(err => {
                 // Show error visibly on the canvas
                 cvs.width = 800; cvs.height = 200;
@@ -142,6 +159,9 @@
             }
             function clamp(value, min, max) {
                 return Math.max(min, Math.min(max, value));
+            }
+            function randomFallbackSizePct() {
+                return rand(MIN_IMG_HEIGHT_PCT, FALLBACK_MAX_IMG_HEIGHT_PCT);
             }
             function abbreviateAddress(address) {
                 if (!address || address.length < 10) return address || 'unknown';
@@ -208,7 +228,10 @@
                     const url = `${ALCHEMY_NFT_BASE}/getOwnersForContract?${params.toString()}`;
                     const response = await fetch(url, { method: 'GET' });
                     if (!response.ok) {
-                        throw new Error(`Alchemy getOwnersForContract failed (${response.status})`);
+                        const error = new Error(`Alchemy getOwnersForContract failed (${response.status})`);
+                        error.status = response.status;
+                        error.isRateLimit = response.status === 429;
+                        throw error;
                     }
 
                     const data = await response.json();
@@ -270,6 +293,19 @@
                         };
                     })
                 );
+            }
+
+            function buildFallbackHolderData(count = FALLBACK_NODE_COUNT) {
+                const safeCount = Math.max(1, Math.min(FALLBACK_NODE_COUNT, count));
+                return Array.from({ length: safeCount }, () => ({
+                    label: '',
+                    imgHeightPct: randomFallbackSizePct()
+                }));
+            }
+
+            function isFailedToFetchError(error) {
+                const msg = String(error?.message || '').toLowerCase();
+                return msg.includes('failed to fetch') || (error instanceof TypeError && msg.includes('fetch'));
             }
 
             function buildNodes(holderData) {
@@ -432,7 +468,6 @@
                 aspectRatio = canvasImg.naturalWidth / canvasImg.naturalHeight;
                 maskBounds = detectMaskBounds(maskImg);
                 REF_W = canvasImg.naturalWidth;
-                buildNodes([]);
 
                 resize();
                 window.addEventListener('resize', resize);
@@ -441,10 +476,22 @@
 
                 getHoldersWithLabelsAndSizes()
                     .then(holders => {
-                        if (holders.length) buildNodes(holders);
+                        if (holders.length) {
+                            buildNodes(holders);
+                        } else {
+                            console.warn('No holders returned from Alchemy; keeping default network.');
+                        }
                     })
                     .catch(error => {
-                        console.error('Failed to load holders:', error);
+                        if (isFailedToFetchError(error)) {
+                            console.warn('Alchemy fetch failed; using local fallback network.', error);
+                            buildNodes(buildFallbackHolderData(FALLBACK_NODE_COUNT));
+                        } else {
+                            console.warn('Alchemy request failed (non-network); keeping default network.', error);
+                        }
+                    })
+                    .finally(() => {
+                        isLoadingHolders = false;
                     });
             }
 
@@ -460,6 +507,7 @@
 
             /* ── Main loop ──────────────────────────────────────── */
             let t0 = null;
+            let isLoadingHolders = true;
 
             function frame(ts) {
                 if (!t0) t0 = ts;
@@ -591,6 +639,15 @@
                 // Reset main context state
                 ctx.globalCompositeOperation = 'source-over';
                 ctx.globalAlpha = 1;
+
+                if (isLoadingHolders) {
+                    const loadingFontSize = Math.max(16, Math.round(Math.min(w, h) * 0.03));
+                    ctx.fillStyle = 'rgba(255,255,255,0.92)';
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    ctx.font = `600 ${loadingFontSize}px "Inter", "Segoe UI", system-ui, sans-serif`;
+                    ctx.fillText('Loading holders...', w / 2, h / 2);
+                }
 
                 requestAnimationFrame(frame);
             }
